@@ -575,7 +575,8 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 
 			listen_sk = inet_lookup_listener(net, &tcp_hashinfo,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
-				skb, ip_hdrlen(skb) + __tcp_hdrlen(th),
+				/* This selects an incorrect listener for sk_reuseport groups */
+				NULL, 0,
 #endif
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3,9,0)
 				iph_v4->saddr, th->source,
@@ -617,7 +618,8 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 
 			listen_sk = inet6_lookup_listener(net, &tcp_hashinfo,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
-				skb, ip_hdrlen(skb) + __tcp_hdrlen(th),
+				/* This selects an incorrect listener for sk_reuseport groups */
+				NULL, 0,
 #endif
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3,9,0)
 				&iph_v6->saddr, th->source,
