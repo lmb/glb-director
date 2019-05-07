@@ -86,8 +86,8 @@ struct glbgue_stats {
 
 struct glbgue_stats __percpu *percpu_stats;
 
-static bool is_established_tcp6(struct net *net);
-static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int inner_ip_ofs, struct iphdr *iph_v4, struct ipv6hdr *iph_v6, struct tcphdr *th);
+static unsigned int is_valid_local_tcp(struct net *net, struct sk_buff *skb, int inner_ip_ofs, struct iphdr *iph_v4, struct ipv6hdr *iph_v6, struct tcphdr *th);
+static unsigned int is_valid_local_udp(struct net *net, struct sk_buff *skb, int inner_ip_ofs, struct iphdr *iph_v4, struct ipv6hdr *iph_v6, struct udphdr *uh);
 
 static unsigned int glbredirect_send_forwarded_skb(struct net *net, struct sk_buff *skb)
 {
@@ -147,7 +147,7 @@ static unsigned int glbredirect_handle_inner_tcp_generic(struct net *net, struct
 	PRINT_DEBUG(KERN_ERR " -> checking for local matching connection\n");
 
 	/* Do we know about this flow? Handle through local IP stack too */
-	if (is_valid_locally(net, skb, inner_ip_ofs, inner_ip_v4, inner_ip_v6, th)) {
+	if (is_valid_local_tcp(net, skb, inner_ip_ofs, inner_ip_v4, inner_ip_v6, th)) {
 		PRINT_DEBUG(KERN_ERR " -> matched local flow, accepting\n");
 		return XT_CONTINUE;
 	}
@@ -517,7 +517,7 @@ glbredirect_tg4(struct sk_buff *skb, const struct xt_action_param *par)
 	}
 }
 
-static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int inner_ip_ofs, struct iphdr *iph_v4, struct ipv6hdr *iph_v6, struct tcphdr *th)
+static unsigned int is_valid_local_tcp(struct net *net, struct sk_buff *skb, int inner_ip_ofs, struct iphdr *iph_v4, struct ipv6hdr *iph_v6, struct tcphdr *th)
 {
 	struct glbgue_stats *s = this_cpu_ptr(percpu_stats);
 
@@ -528,7 +528,7 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 	WARN_ON(th == NULL);
 #endif
 
-	PRINT_DEBUG(KERN_ERR " -> checking for established\n");
+	PRINT_DEBUG(KERN_ERR " -> TCP: checking for established\n");
 
 	/* First check: existing established connection is fine.
 	 * This avoids locking on any central resource (LISTEN socket, conntrack)
@@ -546,7 +546,7 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 						&iph_v6->saddr, th->source,
 						&iph_v6->daddr, ntohs(th->dest),
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
-						inet_iif(skb), 0);
+						inet_iif(skb), inet_sdif(skb));
 #else
 						inet_iif(skb));
 #endif
@@ -563,7 +563,7 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 		}
 	}
 
-	PRINT_DEBUG(KERN_ERR " -> checking for syncookie\n");
+	PRINT_DEBUG(KERN_ERR " -> TCP: checking for syncookie\n");
 
 	/* If syncookies are enabled, then a valid syncookie ACK is also acceptable */
 	if (th->ack && !th->fin && !th->rst && !th->syn) {
@@ -583,7 +583,7 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 #endif
 				iph_v4->daddr, th->dest,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
-				inet_iif(skb), 0);
+				inet_iif(skb), inet_sdif(skb));
 #else
 				inet_iif(skb));
 #endif
@@ -626,7 +626,7 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 #endif
 				&iph_v6->daddr, th->dest,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
-				inet_iif(skb), 0);
+				inet_iif(skb), inet_sdif(skb));
 #else
 				inet_iif(skb));
 #endif
@@ -665,6 +665,58 @@ static unsigned int is_valid_locally(struct net *net, struct sk_buff *skb, int i
 		}
 
 		return ret;
+	}
+
+	return 0;
+}
+
+static unsigned int is_valid_local_udp(struct net *net, struct sk_buff *skb, int inner_ip_ofs, struct iphdr *iph_v4, struct ipv6hdr *iph_v6, struct udphdr *uh);
+{
+	struct glbgue_stats *s = this_cpu_ptr(percpu_stats);
+
+#ifdef DEBUG
+	WARN_ON(net == NULL);
+	WARN_ON(skb == NULL);
+	WARN_ON(iph_v4 == NULL && iph_v6 == NULL);
+	WARN_ON(th == NULL);
+#endif
+
+	PRINT_DEBUG(KERN_ERR " -> UDP: checking for established\n");
+
+	{
+		struct sock *nsk;
+
+		if (likely(iph_v4 != NULL)) {
+			nsk = __udp4_lib_lookup(net,
+						iph_v4->saddr, uh->source,
+						iph_v4->daddr, uh->dest,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
+						inet_iif(skb), inet_sdif(skb),
+#else
+						inet_iif(skb),
+#endif
+						&udp_table, NULL);
+		} else if (likely(iph_v6 != NULL)) {
+			nsk = __udp6_lib_lookup(net,
+						&iph_v6->saddr, uh->source,
+						&iph_v6->daddr, uh->dest,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
+						inet_iif(skb), inet_sdif(skb),
+#else
+						inet_iif(skb),
+#endif
+						&udp_table, NULL);
+		} else {
+			return 0; /* no IPv4 or IPv6 header provided */
+		}
+
+		if (nsk) {
+			u64_stats_update_begin(&s->syncp);
+			s->accepted_established_packets++;
+			u64_stats_update_end(&s->syncp);
+			sock_put(nsk);
+			return 1;
+		}
 	}
 
 	return 0;
